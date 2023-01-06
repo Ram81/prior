@@ -17,7 +17,7 @@ from prior.lock import LockEx
 
 # NOTE: These are unused in this file, but imported to other files.
 # So, leave them here.
-from prior.utils.types import Dataset, DatasetDict, LazyJsonDataset
+from prior.utils.types import Dataset, DatasetDict, LazyJsonDataset, NoCacheLazyJsonDataset
 
 BASE_DIR = f"{os.environ['HOME']}/.prior"
 DATASET_DIR = f"{BASE_DIR}/datasets"
@@ -262,6 +262,7 @@ def load_dataset(
     revision: str = "main",
     entity: str = "allenai",
     offline: bool = False,
+    disable_download: bool = False,
     **kwargs: Any,
 ) -> DatasetDict:
     """Load the dataset from the given revision.
@@ -291,128 +292,134 @@ def load_dataset(
     git_lfs_cmd = _get_git_lfs_cmd()
     token = _get_git_auth_token()
     oldpath = os.environ["PATH"]
+    
+    dataset_path = os.path.abspath(f"{project_dir}/{sha}")
 
     try:
-        # The below PATH setting needs to happen before running any git commands as otherwise git
-        # will not see the git-lfs download which causes all sorts of weird issues.
-        if git_lfs_cmd != "git lfs":
-            # Need to set the path so that git sees git-lfs below
-            os.environ["PATH"] = f'{os.environ["PATH"]}:{os.path.dirname(git_lfs_cmd)}'
+        if not disable_download:
+            print("Download enabled....")
+            # The below PATH setting needs to happen before running any git commands as otherwise git
+            # will not see the git-lfs download which causes all sorts of weird issues.
+            if git_lfs_cmd != "git lfs":
+                # Need to set the path so that git sees git-lfs below
+                os.environ["PATH"] = f'{os.environ["PATH"]}:{os.path.dirname(git_lfs_cmd)}'
 
-        # download the dataset
-        dataset_path = os.path.abspath(f"{project_dir}/{sha}")
-        with LockEx(f"{project_dir}/lock-clone"):
-            if not os.path.exists(dataset_path):
-                commands_run = []
-                try:
-                    logging.debug(
-                        f"Downloading dataset {dataset} at revision {revision} to {dataset_path}."
+            # download the dataset
+            with LockEx(f"{project_dir}/lock-clone"):
+                if not os.path.exists(dataset_path):
+                    commands_run = []
+                    try:
+                        logging.debug(
+                            f"Downloading dataset {dataset} at revision {revision} to {dataset_path}."
+                        )
+                        token_prefix = f"{token}@" if token else ""
+
+                        args = [
+                            "git",
+                            "clone",
+                            f"https://{token_prefix}github.com/{entity}/{dataset}.git",
+                            dataset_path,
+                        ]
+                        print("After clone run git checkout {}".format(sha))
+                        out0 = subprocess.run(
+                            args=args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        
+                        assert out0.returncode == 0
+                        commands_run.append(" ".join(args))
+
+                        logging.debug(f"Downloaded dataset to {dataset_path}")
+                        # change the subprocess working directory to the dataset directory
+                        os.chdir(dataset_path)
+                        commands_run.append(f"cd {dataset_path}")
+
+                        args = ["git", "checkout", sha]
+                        out1 = subprocess.run(
+                            args=args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        assert out1.returncode == 0
+                        commands_run.append(" ".join(args))
+
+                        args = ["git", "lfs", "install"]
+                        out2 = subprocess.run(
+                            args=args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        assert out2.returncode == 0
+                        commands_run.append(" ".join(args))
+
+                        args = ["git", "lfs", "fetch"]
+                        out3 = subprocess.run(
+                            args=args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        assert out3.returncode == 0
+                        commands_run.append(" ".join(args))
+
+                        args = ["git", "lfs", "checkout", sha]
+                        out4 = subprocess.run(
+                            args=args,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL,
+                        )
+                        assert out4.returncode == 0
+                        commands_run.append(" ".join(args))
+
+                        logging.debug(f"Checked out {sha}")
+
+                    except Exception:
+                        commands_run_str = "\n".join(commands_run)
+                        error_msg = (
+                            "An error occurred when cloning or checking out "
+                            f" https://{token_prefix}github.com/{entity}/{dataset}.git. We're"
+                            f" deleting anything downloaded to {dataset_path}."
+                            f" Current PATH is {os.environ['PATH']},"
+                            f" current directory is {os.getcwd()}, and"
+                            f" the command that failed is '{' '.join(args)}'. Before this point"
+                            f" we ran the following commands:"
+                            f"\n```\n{commands_run_str}\n```"
+                        )
+                        if os.path.exists(dataset_path):
+                            shutil.rmtree(dataset_path)
+
+                        raise IOError(error_msg)
+
+            logging.debug(f"Using dataset {dataset} at revision {revision} in {dataset_path}.")
+            os.chdir(dataset_path)
+
+            with LockEx(f"{project_dir}/lock-verify"):
+                sha_of_repo = (
+                    subprocess.check_output(
+                        "git rev-parse --verify HEAD".split(),
                     )
-                    token_prefix = f"{token}@" if token else ""
+                    .decode("utf-8")
+                    .strip()
+                )
+                assert sha_of_repo == sha, (
+                    f"The sha of the repo ({sha_of_repo}) does not match the required sha ({sha})."
+                    f" This should not occur. Please try deleting {dataset_path} and trying again."
+                )
 
-                    args = [
-                        "git",
-                        "clone",
-                        f"https://{token_prefix}github.com/{entity}/{dataset}.git",
-                        dataset_path,
-                    ]
-                    out0 = subprocess.run(
-                        args=args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
+                # HARD RESET of all modified or changed
+                if (
+                    subprocess.check_output(
+                        "git status --short".split(),
                     )
-                    assert out0.returncode == 0
-                    commands_run.append(" ".join(args))
+                    .decode("utf-8")
+                    .strip()
+                    != ""
+                ):
+                    out1 = subprocess.run("git reset --hard HEAD".split(), stdout=subprocess.DEVNULL)
+                    out2 = subprocess.run("git clean -f".split(), stdout=subprocess.DEVNULL)
+                    assert out1.returncode == out2.returncode == 0
 
-                    logging.debug(f"Downloaded dataset to {dataset_path}")
-                    # change the subprocess working directory to the dataset directory
-                    os.chdir(dataset_path)
-                    commands_run.append(f"cd {dataset_path}")
-
-                    args = ["git", "checkout", sha]
-                    out1 = subprocess.run(
-                        args=args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    assert out1.returncode == 0
-                    commands_run.append(" ".join(args))
-
-                    args = ["git", "lfs", "install"]
-                    out2 = subprocess.run(
-                        args=args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    assert out2.returncode == 0
-                    commands_run.append(" ".join(args))
-
-                    args = ["git", "lfs", "fetch"]
-                    out3 = subprocess.run(
-                        args=args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    assert out3.returncode == 0
-                    commands_run.append(" ".join(args))
-
-                    args = ["git", "lfs", "checkout", sha]
-                    out4 = subprocess.run(
-                        args=args,
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL,
-                    )
-                    assert out4.returncode == 0
-                    commands_run.append(" ".join(args))
-
-                    logging.debug(f"Checked out {sha}")
-
-                except Exception:
-                    commands_run_str = "\n".join(commands_run)
-                    error_msg = (
-                        "An error occurred when cloning or checking out "
-                        f" https://{token_prefix}github.com/{entity}/{dataset}.git. We're"
-                        f" deleting anything downloaded to {dataset_path}."
-                        f" Current PATH is {os.environ['PATH']},"
-                        f" current directory is {os.getcwd()}, and"
-                        f" the command that failed is '{' '.join(args)}'. Before this point"
-                        f" we ran the following commands:"
-                        f"\n```\n{commands_run_str}\n```"
-                    )
-                    if os.path.exists(dataset_path):
-                        shutil.rmtree(dataset_path)
-
-                    raise IOError(error_msg)
-
-        logging.debug(f"Using dataset {dataset} at revision {revision} in {dataset_path}.")
         os.chdir(dataset_path)
-
-        with LockEx(f"{project_dir}/lock-verify"):
-            sha_of_repo = (
-                subprocess.check_output(
-                    "git rev-parse --verify HEAD".split(),
-                )
-                .decode("utf-8")
-                .strip()
-            )
-            assert sha_of_repo == sha, (
-                f"The sha of the repo ({sha_of_repo}) does not match the required sha ({sha})."
-                f" This should not occur. Please try deleting {dataset_path} and trying again."
-            )
-
-            # HARD RESET of all modified or changed
-            if (
-                subprocess.check_output(
-                    "git status --short".split(),
-                )
-                .decode("utf-8")
-                .strip()
-                != ""
-            ):
-                out1 = subprocess.run("git reset --hard HEAD".split(), stdout=subprocess.DEVNULL)
-                out2 = subprocess.run("git clean -f".split(), stdout=subprocess.DEVNULL)
-                assert out1.returncode == out2.returncode == 0
-
         out: Dict[str, Any] = {}
         exec(open(f"{dataset_path}/main.py").read(), out)
         out_dataset: DatasetDict = out["load_dataset"](**kwargs)
